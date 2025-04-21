@@ -1,0 +1,15 @@
+{
+    "average_latency_ms": 681.4854266235727,
+    "failed_requests": 95,
+    "failure_rate_percent": 0.9503801520608244,
+    "latency_measurements_count": 9901,
+    "max_latency_ms": 2657.896,
+    "min_latency_ms": 465.806,
+    "p99_latency_ms": 1386.216,
+    "requests_per_second": 330.9408324075697,
+    "server_uptime_seconds": 30.204795,
+    "success_rate_percent": 99.04961984793917,
+    "successful_requests": 9901,
+    "total_requests_processed": 9996,
+    "total_requests_received": 9996
+}

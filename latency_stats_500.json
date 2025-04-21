@@ -1,7 +1,0 @@
-{
-    "failed_requests": 494,
-    "p99_latency_ms": 1618.1,
-    "successful_requests": 9481,
-    "total_elapsed_time_seconds": 44.310512333,
-    "total_requests": 9975
-}

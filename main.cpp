@@ -1,3 +1,4 @@
+
 // Standard C++ Libraries
 #include <iostream>
 #include <string>
@@ -36,22 +37,27 @@
 #include <openssl/err.h>      // For OpenSSL error handling
 #include "spdlog/spdlog.h"    // For logging
 #include "spdlog/sinks/stdout_color_sinks.h" // For console logger
+#include "spdlog/sinks/basic_file_sink.h" // For file logger
+#include <ctime> // For std::time_t, std::tm, std::localtime, std::put_time
 
 // --- Configuration Constants ---
 constexpr int PORT = 5001;
 constexpr size_t BUFFER_SIZE = 1024;
-constexpr long CURL_TIMEOUT_SECONDS = 15L;
+constexpr long CURL_TIMEOUT_SECONDS = 60L;
 constexpr long OAUTH_TIMEOUT_SECONDS = 10L;
-constexpr int SHUTDOWN_CHECK_INTERVAL_MS = 100;
+constexpr int SHUTDOWN_CHECK_INTERVAL_MS = 500;
 constexpr int CONNECTION_LOG_INTERVAL_SECONDS = 5;
 constexpr long long MAX_REQUESTS_BEFORE_SHUTDOWN = 0; // 0 or negative means disabled
 
 // --- Vertex AI Gemini API Configuration ---
 const std::string PROJECT_ID = "gemini-demo-450807"; // Replace with your Project ID
-const std::string LOCATION_ID = "us-central1";
+// const std::string LOCATION_ID = "us-central1";
+const std::string LOCATION_ID = "global";
 // const std::string MODEL_ID = "gemini-2.0-flash-lite-001"; // Or your desired model
-const std::string MODEL_ID = "gemini-2.0-flash-001";
-const std::string API_ENDPOINT_BASE = "us-central1-aiplatform.googleapis.com";
+const std::string MODEL_ID = "gemini-2.0-flash-001"; // Or your desired model
+// const std::string MODEL_ID = "gemini-1.5-flash-002";
+// const std::string API_ENDPOINT_BASE = "us-central1-aiplatform.googleapis.com";
+const std::string API_ENDPOINT_BASE = "aiplatform.googleapis.com";
 const std::string GENERATE_CONTENT_API = "generateContent"; // "streamGenerateContent" Or "generateContent" if not streaming
 const std::string SERVICE_ACCOUNT_KEY_PATH = "./service-account-key.json";
 // --- End Vertex AI Config ---
@@ -98,7 +104,7 @@ std::thread g_stdin_thread; // Added handle for stdin monitor thread
 std::atomic<long long> g_total_requests{0};
 std::atomic<long long> g_successful_requests{0};
 std::atomic<long long> g_failed_requests{0};
-std::vector<double> g_success_latencies_ms;
+std::vector<double> g_success_latencies_ms; // Changed back
 std::mutex g_latency_mutex;
 std::atomic<long long> g_processed_requests{0}; // Counter for processed requests
 std::chrono::steady_clock::time_point g_server_start_time; // Server start time
@@ -394,16 +400,31 @@ void process_completed_transfer(CURLMsg *msg) {
     curl_easy_getinfo(easy_handle, CURLINFO_TOTAL_TIME_T, &total_time_us);
     double total_time_ms = static_cast<double>(total_time_us) / 1000.0;
 
+    // Get the dedicated latency logger
+    auto latency_logger = spdlog::get("latency_logger");
+    if (!latency_logger) {
+         // Log error to default logger if latency logger isn't found
+         spdlog::error("CRITICAL: Latency logger not found. Cannot log latency data.");
+         // Consider if you want to proceed or handle this more drastically
+    }
+
     std::string message_to_send; // Message to send back to client
     bool request_succeeded = false; // Flag to track success for stats
 
     if (res == CURLE_OK) {
         long http_code = 0;
         curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &http_code);
+
+        // Log basic info to default logger
         spdlog::info("API request completed for client {} with HTTP status {}. Transfer time: {:.3f}ms",
                      req_data->client_socket,
                      http_code,
                      total_time_ms);
+
+        // Log latency info using the logger's pattern (timestamp is automatic)
+        if (latency_logger) {
+            latency_logger->info("{:.3f},{}", total_time_ms, http_code);
+        }
        // Log successful response body at debug level
        spdlog::debug("Successful API response body for client {}: {}", req_data->client_socket, req_data->response_buffer);
 #ifdef ENABLE_VERBOSE_LOGGING
@@ -501,20 +522,31 @@ void process_completed_transfer(CURLMsg *msg) {
        // Increment success counter outside the try-catch, but only if http_code was 200
        if (request_succeeded) {
             g_successful_requests++;
-            // Store latency for successful requests
+            // Store latency for successful requests (Reverted)
             std::lock_guard<std::mutex> lock(g_latency_mutex);
             g_success_latencies_ms.push_back(total_time_ms);
        } else {
-            g_failed_requests++; // Increment failure counter if HTTP error occurred
+            g_failed_requests++; // Increment failure counter if HTTP error occurred (non-200)
        }
 
     } else {
         g_failed_requests++; // Increment failure counter if libcurl error occurred
-        // Also use total_time_ms for error logging duration
+
+        // Log basic info to default logger
         spdlog::error("API request failed for client {} (libcurl error: {}). Transfer time: {:.3f}ms",
                       req_data->client_socket,
-                     curl_easy_strerror(res),
-                     total_time_ms);
+                      curl_easy_strerror(res),
+                      total_time_ms);
+
+        // Log latency info for failed requests using the logger's pattern
+        if (latency_logger) {
+            // Log negative CURL code and the error string
+            latency_logger->info("{:.3f},{},\"{}\"",
+                                 total_time_ms,
+                                 -static_cast<int>(res), // Use negative code for failures
+                                 curl_easy_strerror(res)); // Add error string
+        }
+
        message_to_send = "Translation failed (libcurl error).\n";
    }
 
@@ -885,24 +917,56 @@ void log_active_connections() {
 
 bool initialize_logging() {
     try {
+        // 1. Create console sink (for default logger)
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        // Customize log pattern if desired
-        // console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
-        auto logger = std::make_shared<spdlog::logger>("logger", spdlog::sinks_init_list{console_sink});
-        // Optionally add file sink later
-        spdlog::set_default_logger(logger);
+        // console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v"); // Optional pattern
+
+        // 2. Create file sink (for error logger)
+        auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("error_log.txt", true); // true = truncate file on open
+        // file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v"); // Optional different pattern for file
+
+        // 3. Create and register the default logger (console only)
+        auto default_logger = std::make_shared<spdlog::logger>("default_logger", spdlog::sinks_init_list{console_sink});
+        spdlog::set_default_logger(default_logger);
+
+        // 4. Create and register the error logger (file only)
+        auto error_logger = std::make_shared<spdlog::logger>("error_logger", spdlog::sinks_init_list{file_sink});
+        spdlog::register_logger(error_logger);
+        error_logger->set_level(spdlog::level::warn); // Log warnings and errors to the file
+        error_logger->flush_on(spdlog::level::warn); // Flush immediately for warnings and errors
+
+        // 5. Create and register the latency logger (latency_log.txt)
+        try {
+            auto latency_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>("latency_log.txt", false); // false = append
+            // Set pattern to include timestamp automatically, then the rest of the message (%v)
+            latency_sink->set_pattern("[%Y-%m-%dT%H:%M:%S.%e%z] %v"); // Example: [2025-04-21T16:56:49.123+0900] <latency>,<status>
+            auto latency_logger = std::make_shared<spdlog::logger>("latency_logger", spdlog::sinks_init_list{latency_sink});
+            spdlog::register_logger(latency_logger);
+            latency_logger->set_level(spdlog::level::info); // Log all info messages
+            latency_logger->flush_on(spdlog::level::info); // Flush immediately
+        } catch (const spdlog::spdlog_ex& ex) {
+            spdlog::error("Failed to initialize latency logger: {}", ex.what());
+            // Continue without latency logger if it fails
+        }
+
+
+        // 6. Set log level for the default (console) logger
 #ifdef ENABLE_VERBOSE_LOGGING
         spdlog::set_level(spdlog::level::debug); // Set debug level if verbose
         spdlog::debug("Verbose logging enabled.");
 #else
         spdlog::set_level(spdlog::level::info); // Default level
 #endif
-        spdlog::flush_on(spdlog::level::info); // Flush logs immediately for info level and above
-        spdlog::info("Spdlog initialized.");
+        spdlog::flush_on(spdlog::level::info); // Flush console logs immediately for info level and above
+
+        spdlog::info("Spdlog initialized with console, error file, and latency file loggers.");
         return true;
     } catch (const spdlog::spdlog_ex& ex) {
         // Use std::cerr as spdlog failed
         std::cerr << "CRITICAL: Log initialization failed: " << ex.what() << std::endl;
+        return false;
+    } catch (const std::exception& e) { // Catch other potential errors (e.g., file system issues)
+        std::cerr << "CRITICAL: Error during logging setup: " << e.what() << std::endl;
         return false;
     }
 }
@@ -1127,18 +1191,40 @@ void calculate_and_write_stats(const std::string& filename) {
     long long total = g_total_requests.load();
     long long successful = g_successful_requests.load();
     long long failed = g_failed_requests.load();
+    long long processed = g_processed_requests.load(); // Also load processed count for RPS
 
-    double p99_latency_ms = -1.0; // Default value if calculation fails or no data
+    // Initialize latency stats
+    double average_latency_ms = 0.0;
+    double min_latency_ms = 0.0;
+    double max_latency_ms = 0.0;
+    double p99_latency_ms = 0.0; // Use 0.0 as default, will be set to null later if no data
+    double requests_per_second = (elapsed_seconds > 0) ? (static_cast<double>(processed) / elapsed_seconds) : 0.0;
+    double success_rate = (total > 0) ? (static_cast<double>(successful) / total * 100.0) : 0.0;
+    double failure_rate = (total > 0) ? (static_cast<double>(failed) / total * 100.0) : 0.0;
+
     std::vector<double> latencies_copy;
 
     // Lock, copy latency data, and unlock
     {
         std::lock_guard<std::mutex> lock(g_latency_mutex);
-        latencies_copy = g_success_latencies_ms; // Copy the vector
+        latencies_copy = g_success_latencies_ms; // Copy the vector (Reverted)
     }
 
     if (!latencies_copy.empty()) {
-        // Sort latencies to calculate percentile
+        // Calculate sum for average
+        double sum = 0.0;
+        for (double latency : latencies_copy) {
+            sum += latency;
+        }
+        average_latency_ms = sum / latencies_copy.size();
+
+        // Find min and max latency
+        // Note: minmax_element requires non-empty range
+        auto minmax = std::minmax_element(latencies_copy.begin(), latencies_copy.end());
+        min_latency_ms = *minmax.first;
+        max_latency_ms = *minmax.second;
+
+        // Sort latencies to calculate percentile (do this *after* min/max)
         std::sort(latencies_copy.begin(), latencies_copy.end());
 
         // Calculate p99 index (adjusting for 0-based index)
@@ -1148,27 +1234,40 @@ void calculate_and_write_stats(const std::string& filename) {
         if (index < latencies_copy.size()) {
             p99_latency_ms = latencies_copy[index];
             spdlog::info("p99 Latency calculated: {:.3f} ms", p99_latency_ms);
-        } else if (!latencies_copy.empty()) {
-             // Handle edge case: if index is out of bounds but vector not empty, use the max value
-             p99_latency_ms = latencies_copy.back();
+        } else {
+             // Should not happen if latencies_copy is not empty, but as fallback use max
+             p99_latency_ms = latencies_copy.back(); // which is max_latency_ms
              spdlog::warn("p99 index calculation resulted in out-of-bounds, using max latency ({:.3f} ms) instead.", p99_latency_ms);
         }
+        spdlog::info("Average Latency: {:.3f} ms, Min Latency: {:.3f} ms, Max Latency: {:.3f} ms",
+                     average_latency_ms, min_latency_ms, max_latency_ms);
+
     } else {
-        spdlog::info("No successful requests recorded, cannot calculate p99 latency.");
+        spdlog::info("No successful requests recorded, cannot calculate latency statistics."); // Reverted message
+        // Set latencies to null equivalent for JSON if no data
+        average_latency_ms = -1.0; // Use negative as sentinel for null
+        min_latency_ms = -1.0;
+        max_latency_ms = -1.0;
+        p99_latency_ms = -1.0;
     }
 
     // Create JSON object
     nlohmann::json stats_json;
-    stats_json["total_requests"] = total;
+    stats_json["server_uptime_seconds"] = elapsed_seconds;
+    stats_json["total_requests_received"] = total;
+    stats_json["total_requests_processed"] = processed;
     stats_json["successful_requests"] = successful;
     stats_json["failed_requests"] = failed;
-    stats_json["total_elapsed_time_seconds"] = elapsed_seconds; // Use the declared and potentially calculated value
-    // Use null if p99 couldn't be calculated, otherwise use the value
-    if (p99_latency_ms < 0.0) {
-        stats_json["p99_latency_ms"] = nullptr;
-    } else {
-        stats_json["p99_latency_ms"] = p99_latency_ms;
-    }
+    stats_json["success_rate_percent"] = success_rate;
+    stats_json["failure_rate_percent"] = failure_rate;
+    stats_json["requests_per_second"] = requests_per_second;
+    stats_json["latency_measurements_count"] = latencies_copy.size();
+
+    // Add latency stats, using null if no data was available
+    stats_json["average_latency_ms"] = (average_latency_ms < 0.0) ? nullptr : nlohmann::json(average_latency_ms);
+    stats_json["min_latency_ms"] = (min_latency_ms < 0.0) ? nullptr : nlohmann::json(min_latency_ms);
+    stats_json["max_latency_ms"] = (max_latency_ms < 0.0) ? nullptr : nlohmann::json(max_latency_ms);
+    stats_json["p99_latency_ms"] = (p99_latency_ms < 0.0) ? nullptr : nlohmann::json(p99_latency_ms);
 
 
     // Write JSON to file
